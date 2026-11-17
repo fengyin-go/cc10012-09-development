@@ -67,11 +67,87 @@
       <span>共 {{ total }} 条多维下钻记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <section class="panel">
+      <h3>筛选结果记录集下钻（跨模块）</h3>
+      <p class="hint">
+        钻取明细直接来自数据筛选模块发布的筛选结果记录集命中快照，命中行与钻取明细一致；
+        结果集只读，越权访问会被拒绝。
+      </p>
+      <div class="filter-bar">
+        <label class="filter-item">
+          <span>筛选结果记录集</span>
+          <select v-model="drillSetId">
+            <option v-for="set in drillSets" :key="set.id" :value="set.id">
+              {{ set.id }} · {{ set.ruleCode }} v{{ set.ruleVersion }} · {{ set.owner }}
+            </option>
+          </select>
+        </label>
+        <label class="filter-item">
+          <span>下钻维度</span>
+          <select v-model="drillDim">
+            <option v-for="dim in drillDimensions" :key="dim">{{ dim }}</option>
+          </select>
+        </label>
+        <button class="btn" type="button" @click="runDrill">下钻</button>
+      </div>
+      <p v-if="drillMessage" class="msg-err">{{ drillMessage }}</p>
+      <p v-if="!drillSets.length" class="hint">当前身份下没有可读的筛选结果记录集，请先在数据筛选模块执行规则。</p>
+
+      <template v-if="drillGroups.length">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>{{ drillDim }}</th>
+              <th>命中行数</th>
+              <th>金额合计</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="group in drillGroups" :key="group.value">
+              <td>{{ group.value }}</td>
+              <td>{{ group.count }}</td>
+              <td>{{ group.amountSum }}</td>
+              <td>
+                <button class="link" type="button" @click="showGroup(group)">查看明细</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="hint">
+          各分组行数合计 {{ groupTotal }} 行 = 结果集 {{ drillSetInfo?.id }} 返回行数
+          {{ drillSetInfo?.returnedCount }}，命中行与钻取明细一致。
+        </p>
+      </template>
+
+      <div v-if="drillDetail.length" class="panel-sub">
+        <h4>{{ drillDim }} = {{ drillActiveGroup }} 的钻取明细（{{ drillDetail.length }} 行）</h4>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>订单编号</th><th>金额</th><th>区域</th><th>品类</th><th>客户等级</th><th>下单日期</th><th>归属单位</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in drillDetail" :key="row.id">
+              <td>{{ row.订单编号 }}</td>
+              <td>{{ row.金额 }}</td>
+              <td>{{ row.区域 }}</td>
+              <td>{{ row.品类 }}</td>
+              <td>{{ row.客户等级 }}</td>
+              <td>{{ row.下单日期 }}</td>
+              <td>{{ row.归属单位 }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
   </section>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 
 import {
   downloadEntries,
@@ -79,6 +155,15 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/local-service'
+import {
+  DRILL_DIMENSIONS,
+  drillResultSet,
+  listVisibleResultSets,
+  type DrillGroup,
+  type FilterResultSet,
+  type OrderRow,
+} from '@/api/filter-service'
+import { useSessionStore } from '@/stores/session'
 import type { EntryRow } from '@/data/types'
 
 const meta = moduleMeta('drill')
@@ -86,6 +171,8 @@ const columns = ["路径编号", "起点维度", "下钻层数", "层级维度�
 const actions = ["提交校验", "启用路径", "停用路径"]
 const statuses = ["草稿", "待校验", "已启用", "已停用"]
 const stats = [{"label": "下钻路径总数", "value": 0}, {"label": "已启用路径", "value": 0}, {"label": "待校验路径", "value": 0}]
+
+const store = useSessionStore()
 
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
@@ -97,6 +184,60 @@ const statusSummary = computed(() =>
     status,
     count: rows.value.filter((row) => String(row.status) === status).length,
   })),
+)
+
+const drillDimensions = DRILL_DIMENSIONS
+const drillSets = ref<FilterResultSet[]>([])
+const drillSetId = ref('')
+const drillDim = ref<string>('区域')
+const drillGroups = ref<DrillGroup[]>([])
+const drillDetail = ref<OrderRow[]>([])
+const drillActiveGroup = ref('')
+const drillMessage = ref('')
+const drillSetInfo = ref<FilterResultSet>()
+const groupTotal = computed(() => drillGroups.value.reduce((sum, group) => sum + group.count, 0))
+
+function refreshDrillSets() {
+  drillSets.value = listVisibleResultSets(store.currentOperator)
+  if (!drillSets.value.some((set) => set.id === drillSetId.value)) {
+    drillSetId.value = drillSets.value.length ? drillSets.value[0].id : ''
+  }
+}
+
+function runDrill() {
+  drillMessage.value = ''
+  drillDetail.value = []
+  drillActiveGroup.value = ''
+  if (!drillSetId.value) {
+    drillGroups.value = []
+    drillMessage.value = '请先选择筛选结果记录集'
+    return
+  }
+  const result = drillResultSet(drillSetId.value, drillDim.value, store.currentOperator)
+  if (!result.ok || !result.data) {
+    drillGroups.value = []
+    drillSetInfo.value = undefined
+    drillMessage.value = result.message
+    return
+  }
+  drillGroups.value = result.data.groups
+  drillSetInfo.value = result.data.set
+}
+
+function showGroup(group: DrillGroup) {
+  drillActiveGroup.value = group.value
+  drillDetail.value = group.rows
+}
+
+watch(
+  () => store.operator,
+  () => {
+    drillGroups.value = []
+    drillDetail.value = []
+    drillSetInfo.value = undefined
+    drillMessage.value = ''
+    refreshDrillSets()
+  },
 )
 
 function resetFilters() {
@@ -133,5 +274,8 @@ function reload() {
   }
 }
 
-onMounted(reload)
+onMounted(() => {
+  reload()
+  refreshDrillSets()
+})
 </script>
